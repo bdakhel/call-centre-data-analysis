@@ -1,0 +1,722 @@
+// =====================================================================
+//  utility-cx-insights — DAX measure library
+//  Model: see powerbi/model_relationships.md
+//  All data is SYNTHETIC (see CLAUDE.md).
+// =====================================================================
+//
+//  HOW TO USE THIS FILE
+//  Display folders are a model property, not DAX syntax, so they cannot be
+//  declared inline. Two ways to apply them:
+//
+//    Manually  — Model view → select the measure → Properties → Display folder,
+//                pasting the folder named in each section banner below.
+//    Scripted  — open the model in Tabular Editor and run the C# snippet at the
+//                bottom of this file. It reads the folder from each measure's
+//                description and sets everything in one pass.
+//
+//  The `///` lines are Tabular Editor description syntax; they survive the
+//  round-trip and show as tooltips in the report.
+//
+//  CONVENTIONS
+//    * Measures that return a share are named "... %" and formatted 0.0%.
+//      Their month-on-month counterparts are in PERCENTAGE POINTS, suffixed
+//      "(pp)", because the change in a percentage is not itself a percentage.
+//    * DIVIDE() everywhere, never "/". It returns BLANK on a zero denominator
+//      instead of an error, so a visual with no rows shows empty, not red.
+//    * Base measures in "99 Base" are building blocks. Hide them from report
+//      view once the report is built.
+//
+// =====================================================================
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  99 Base
+//  Building blocks. Hide these from report view.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Count of contacts in the current filter context. The denominator for
+/// almost everything else.
+Interactions =
+COUNTROWS ( fact_interactions )
+
+
+/// Contacts that carry a model sentiment score. Used as the sentiment
+/// denominator so an unscored backlog never silently deflates the rates.
+Scored Interactions =
+CALCULATE (
+    [Interactions],
+    KEEPFILTERS ( fact_interactions[has_score] = TRUE () )
+)
+
+
+/// Contacts that opened a case (about 91%). The correct denominator for
+/// repeat contact — a contact with no case cannot have a follow-up logged.
+Cases =
+CALCULATE (
+    [Interactions],
+    KEEPFILTERS ( fact_interactions[has_case] = TRUE () )
+)
+
+
+/// Contacts where the customer answered the post-contact survey (~15%).
+Survey Responses =
+CALCULATE (
+    [Interactions],
+    KEEPFILTERS ( fact_interactions[has_survey_response] = TRUE () )
+)
+
+
+/// Total handle seconds. Kept separate so AHT can be re-derived at any grain.
+Handle Seconds =
+SUM ( fact_interactions[handle_time_sec] )
+
+
+/// Sum of each contact's OWN agent target. Targets vary per agent (420–480s),
+/// so the benchmark has to be summed per row — an AVERAGE of dim_agent targets
+/// would weight a 10-contact agent the same as a 170-contact one.
+Target Handle Seconds =
+SUMX ( fact_interactions, RELATED ( dim_agent[aht_target_sec] ) )
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  01 Volume
+// ─────────────────────────────────────────────────────────────────────
+
+/// Contacts handled. Format: #,0
+Contacts =
+[Interactions]
+
+
+/// Distinct customers who made contact. Lower than Contacts because some
+/// customers come back — that gap is the repeat-contact story.
+Customers =
+DISTINCTCOUNT ( fact_interactions[customer_id] )
+
+
+/// Average contacts per business day, using dim_date[is_business_day] so
+/// weekends and Alberta statutory holidays do not drag the average down.
+Contacts per Business Day =
+VAR BusinessDays =
+    CALCULATE (
+        COUNTROWS ( dim_date ),
+        dim_date[is_business_day] = TRUE (),
+        REMOVEFILTERS ( fact_interactions )
+    )
+RETURN
+    DIVIDE ( [Interactions], BusinessDays )
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  02 Efficiency
+// ─────────────────────────────────────────────────────────────────────
+
+/// Average handle time in minutes. Format: 0.0
+AHT (minutes) =
+DIVIDE ( [Handle Seconds], [Interactions] * 60 )
+
+
+/// Average hold time in minutes — excluded from AHT in this dataset, so the
+/// two are independent. Format: 0.0
+Hold (minutes) =
+DIVIDE ( SUM ( fact_interactions[hold_time_sec] ), [Interactions] * 60 )
+
+
+/// Share of contacts that involved any hold at all. Format: 0.0%
+Hold Rate % =
+DIVIDE (
+    CALCULATE ( [Interactions], KEEPFILTERS ( fact_interactions[had_hold] = TRUE () ) ),
+    [Interactions]
+)
+
+
+/// The weighted target, in minutes, for whatever contacts are in context.
+/// Format: 0.0
+AHT Target (minutes) =
+DIVIDE ( [Target Handle Seconds], [Interactions] * 60 )
+
+
+/// How far actual handle time runs over (+) or under (−) target, as a share
+/// of target. Computed from the two SUMS, never from an average of per-call
+/// percentages — those do not re-aggregate. Format: +0.0%;-0.0%
+AHT vs Target % =
+DIVIDE ( [Handle Seconds] - [Target Handle Seconds], [Target Handle Seconds] )
+
+
+/// The same variance expressed per contact in minutes, which is the version
+/// a team lead can act on. Format: +0.0;-0.0
+AHT vs Target (minutes) =
+DIVIDE ( [Handle Seconds] - [Target Handle Seconds], [Interactions] * 60 )
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  03 Quality \ Survey
+// ─────────────────────────────────────────────────────────────────────
+
+/// Top-2-box CSAT: the share of RESPONDENTS scoring 4 or 5.
+/// The denominator is survey responses, not contacts — see
+/// "Survey Response Rate %" for how few that is. Format: 0.0%
+CSAT % =
+DIVIDE (
+    CALCULATE (
+        [Interactions],
+        KEEPFILTERS ( fact_interactions[is_csat_promoter] = TRUE () )
+    ),
+    [Survey Responses]
+)
+
+
+/// Share of respondents scoring 1 or 2. Watch alongside CSAT % — both can
+/// rise at once if the middle empties out. Format: 0.0%
+CSAT Detractor % =
+DIVIDE (
+    CALCULATE (
+        [Interactions],
+        KEEPFILTERS ( fact_interactions[is_csat_detractor] = TRUE () )
+    ),
+    [Survey Responses]
+)
+
+
+/// Mean 1–5 score among respondents. Format: 0.00
+Avg CSAT Score =
+AVERAGE ( fact_interactions[csat_score] )
+
+
+/// Share of contacts that produced a survey response.
+///
+/// ⚠ Around 15%, and NOT a random 15%: unhappy customers answer far more
+/// often. Every survey measure above is therefore biased low against true
+/// customer sentiment. See docs/validation.md. Format: 0.0%
+Survey Response Rate % =
+DIVIDE ( [Survey Responses], [Interactions] )
+
+
+/// The CSAT target for the agents in context, weighted by their response
+/// volume rather than averaged across the roster. Format: 0.0%
+CSAT Target % =
+DIVIDE (
+    SUMX (
+        FILTER ( fact_interactions, fact_interactions[has_survey_response] = TRUE () ),
+        RELATED ( dim_agent[csat_target] )
+    ),
+    [Survey Responses]
+)
+
+
+/// CSAT performance against target, in percentage points.
+/// Positive is ahead of target. Format: +0.0;-0.0
+CSAT vs Target (pp) =
+( [CSAT %] - [CSAT Target %] ) * 100
+
+
+/// Share of respondents who said their issue was resolved.
+/// Note is_resolved is blank for non-respondents, so this is respondents
+/// only — it is not a first-contact-resolution rate. Format: 0.0%
+Survey Resolved % =
+DIVIDE (
+    CALCULATE (
+        [Interactions],
+        KEEPFILTERS ( fact_interactions[is_resolved] = TRUE () )
+    ),
+    [Survey Responses]
+)
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  03 Quality \ FCR
+// ─────────────────────────────────────────────────────────────────────
+
+/// First contact resolution from the monthly SQM scorecard. Format: 0.0
+///
+/// ⚠ THIS IS AN UNWEIGHTED MEAN. The source supplies a finished percentage
+/// with no numerator or denominator behind it, so rolling several months or
+/// teams together treats a 500-contact team the same as a 50-contact one.
+/// Trustworthy at month × team grain; treat any total as indicative only.
+/// A production feed should carry resolved_contacts and total_contacts and
+/// let this measure compute the ratio properly.
+FCR % (SQM) =
+AVERAGE ( fact_sqm_monthly[fcr_pct] )
+
+
+/// The published industry benchmark, around 74%. Format: 0.0
+FCR Benchmark % =
+AVERAGE ( fact_sqm_monthly[industry_benchmark_fcr_pct] )
+
+
+/// Gap to benchmark in percentage points. Positive beats the industry.
+/// Format: +0.0;-0.0
+FCR vs Benchmark (pp) =
+[FCR % (SQM)] - [FCR Benchmark %]
+
+
+/// Count of month × team cells sitting above benchmark — a quick way to see
+/// whether a gain is broad or one team carrying the average. Format: #,0
+Months Above Benchmark =
+CALCULATE (
+    COUNTROWS ( fact_sqm_monthly ),
+    KEEPFILTERS ( fact_sqm_monthly[is_above_benchmark] = TRUE () )
+)
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  03 Quality \ Repeat Contact
+// ─────────────────────────────────────────────────────────────────────
+
+/// Contacts followed by another contact from the same customer within 7 days.
+Repeat Contacts =
+CALCULATE (
+    [Interactions],
+    KEEPFILTERS ( fact_interactions[is_repeat_contact_7d] = TRUE () )
+)
+
+
+/// Repeat contact rate — the operational mirror of FCR, and unlike FCR % it
+/// is computed from counts, so it re-aggregates correctly at any grain.
+///
+/// The denominator is CASES, not contacts: the flag is only meaningful where
+/// a case exists. The flag is forward-looking — it marks the FIRST contact of
+/// a pair, not the follow-up. Format: 0.0%
+Repeat Contact Rate % =
+DIVIDE ( [Repeat Contacts], [Cases] )
+
+
+/// Share of cases escalated. Format: 0.0%
+Escalation Rate % =
+DIVIDE (
+    CALCULATE ( [Interactions], KEEPFILTERS ( fact_interactions[is_escalated] = TRUE () ) ),
+    [Cases]
+)
+
+
+/// Mean days from case open to close, closed cases only — open cases have no
+/// closed date and are excluded rather than counted as zero. Format: 0.0
+Avg Days to Close =
+AVERAGE ( fact_interactions[days_to_close] )
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  04 Sentiment
+// ─────────────────────────────────────────────────────────────────────
+
+/// Share of scored contacts the model called negative. Format: 0.0%
+% Negative =
+DIVIDE (
+    CALCULATE (
+        [Interactions],
+        KEEPFILTERS ( fact_interactions[sentiment_label] = "negative" )
+    ),
+    [Scored Interactions]
+)
+
+
+/// Share of scored contacts the model called positive. Format: 0.0%
+% Positive =
+DIVIDE (
+    CALCULATE (
+        [Interactions],
+        KEEPFILTERS ( fact_interactions[sentiment_label] = "positive" )
+    ),
+    [Scored Interactions]
+)
+
+
+/// Net sentiment: % positive minus % negative, on a −100 to +100 scale.
+/// Reads like NPS — zero means positives and negatives cancel.
+/// Format: +0.0;-0.0
+Net Sentiment =
+( [% Positive] - [% Negative] ) * 100
+
+
+/// Mean of the continuous score (P(positive) − P(negative), −1 to +1).
+/// Finer-grained than Net Sentiment and better for trend lines, since it
+/// moves before a contact crosses a label boundary. Format: +0.00;-0.00
+Avg Sentiment Score =
+AVERAGE ( fact_interactions[sentiment_score] )
+
+
+/// How far sentiment travelled from the first third of the customer's turns
+/// to the last third. Positive means conversations end better than they start
+/// — the recovery signal. Format: +0.00;-0.00
+Sentiment Shift =
+AVERAGE ( fact_interactions[sentiment_shift] )
+
+
+/// Contacts that recovered strongly (shift > +0.4): started poorly, ended
+/// well. The coaching win to celebrate. Format: #,0
+Recovered Contacts =
+CALCULATE (
+    [Interactions],
+    KEEPFILTERS ( fact_interactions[sentiment_shift] > 0.4 )
+)
+
+
+/// Contacts that deteriorated (shift < −0.3) — started fine and ended badly.
+/// The ones worth listening to. Format: #,0
+Deteriorated Contacts =
+CALCULATE (
+    [Interactions],
+    KEEPFILTERS ( fact_interactions[sentiment_shift] < -0.3 )
+)
+
+
+// ── Calibrated alternative ───────────────────────────────────────────
+//  Validation against 100 human labels found sentiment_label is systematically
+//  too gloomy: 61% agreement, and EVERY ONE of its 39 errors judged the
+//  customer unhappier than the human did. Scoring the END of the conversation
+//  instead lifted held-out agreement from 56% to 77%.
+//
+//  Prefer these two for anything customer-facing. Thresholds are the
+//  validated band (−0.25 / +0.90). See docs/validation.md.
+
+/// Share of contacts ending negative, using the calibrated end-of-call band.
+/// Better aligned to human judgement than % Negative. Format: 0.0%
+% Negative (Calibrated) =
+DIVIDE (
+    CALCULATE (
+        [Interactions],
+        KEEPFILTERS ( fact_interactions[sentiment_end] < -0.25 )
+    ),
+    [Scored Interactions]
+)
+
+
+/// Net sentiment judged on how the customer sounded at the END of the
+/// contact. The recommended headline sentiment measure.
+/// Format: +0.0;-0.0
+Net Sentiment (Calibrated) =
+VAR Positives =
+    CALCULATE (
+        [Interactions],
+        KEEPFILTERS ( fact_interactions[sentiment_end] > 0.9 )
+    )
+VAR Negatives =
+    CALCULATE (
+        [Interactions],
+        KEEPFILTERS ( fact_interactions[sentiment_end] < -0.25 )
+    )
+RETURN
+    DIVIDE ( Positives - Negatives, [Scored Interactions] ) * 100
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  05 Change over time \ Previous month
+//  Prior-period values. Hide these; surface the "MoM" measures instead.
+// ─────────────────────────────────────────────────────────────────────
+//
+//  dim_date must be marked as a date table for any of this to work
+//  (Table tools → Mark as date table → dim_date[date]).
+//
+//  DATEADD is used for the daily-grain facts. FCR uses PREVIOUSMONTH because
+//  fact_sqm_monthly only holds the first of each month — DATEADD on a single
+//  day would land on a date that has no scorecard row and return blank.
+
+/// Contacts in the previous month.
+Contacts PM =
+CALCULATE ( [Interactions], DATEADD ( dim_date[date], -1, MONTH ) )
+
+/// AHT in the previous month.
+AHT (minutes) PM =
+CALCULATE ( [AHT (minutes)], DATEADD ( dim_date[date], -1, MONTH ) )
+
+/// CSAT in the previous month.
+CSAT % PM =
+CALCULATE ( [CSAT %], DATEADD ( dim_date[date], -1, MONTH ) )
+
+/// Net sentiment in the previous month.
+Net Sentiment PM =
+CALCULATE ( [Net Sentiment], DATEADD ( dim_date[date], -1, MONTH ) )
+
+/// Negative share in the previous month.
+% Negative PM =
+CALCULATE ( [% Negative], DATEADD ( dim_date[date], -1, MONTH ) )
+
+/// Repeat contact rate in the previous month.
+Repeat Contact Rate % PM =
+CALCULATE ( [Repeat Contact Rate %], DATEADD ( dim_date[date], -1, MONTH ) )
+
+/// FCR in the previous month. PREVIOUSMONTH, not DATEADD — see the note above.
+FCR % (SQM) PM =
+CALCULATE ( [FCR % (SQM)], PREVIOUSMONTH ( dim_date[date] ) )
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  05 Change over time \ MoM
+//  Month-on-month movement. Rates move in percentage points, counts in
+//  both absolute and relative terms.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Change in contact volume vs last month. Format: +#,0;-#,0
+Contacts MoM =
+IF ( NOT ISBLANK ( [Contacts PM] ), [Interactions] - [Contacts PM] )
+
+
+/// Percentage change in contact volume vs last month. Format: +0.0%;-0.0%
+Contacts MoM % =
+DIVIDE ( [Interactions] - [Contacts PM], [Contacts PM] )
+
+
+/// Change in AHT vs last month, in minutes. Negative is an improvement, so
+/// set the conditional formatting accordingly. Format: +0.0;-0.0
+AHT MoM (minutes) =
+IF ( NOT ISBLANK ( [AHT (minutes) PM] ), [AHT (minutes)] - [AHT (minutes) PM] )
+
+
+/// Change in CSAT vs last month, in percentage points. Format: +0.0;-0.0
+CSAT MoM (pp) =
+IF ( NOT ISBLANK ( [CSAT % PM] ), ( [CSAT %] - [CSAT % PM] ) * 100 )
+
+
+/// Change in net sentiment vs last month, in points (it is already ×100).
+/// Format: +0.0;-0.0
+Net Sentiment MoM =
+IF ( NOT ISBLANK ( [Net Sentiment PM] ), [Net Sentiment] - [Net Sentiment PM] )
+
+
+/// Change in the negative share vs last month, in percentage points.
+/// Negative is an improvement. Format: +0.0;-0.0
+% Negative MoM (pp) =
+IF ( NOT ISBLANK ( [% Negative PM] ), ( [% Negative] - [% Negative PM] ) * 100 )
+
+
+/// Change in repeat contact rate vs last month, in percentage points.
+/// Negative is an improvement. Format: +0.0;-0.0
+Repeat Contact Rate MoM (pp) =
+IF (
+    NOT ISBLANK ( [Repeat Contact Rate % PM] ),
+    ( [Repeat Contact Rate %] - [Repeat Contact Rate % PM] ) * 100
+)
+
+
+/// Change in FCR vs last month, in percentage points. Format: +0.0;-0.0
+FCR MoM (pp) =
+IF ( NOT ISBLANK ( [FCR % (SQM) PM] ), [FCR % (SQM)] - [FCR % (SQM) PM] )
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  06 Variance to target
+//  Every KPI that has a target, and how far off it is.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Share of contacts handled within the agent's own AHT target.
+/// A companion to AHT vs Target %: the average can look fine while a long
+/// tail of overruns hides inside it. Format: 0.0%
+% Within AHT Target =
+VAR WithinTarget =
+    COUNTROWS (
+        FILTER (
+            fact_interactions,
+            fact_interactions[handle_time_sec] <= RELATED ( dim_agent[aht_target_sec] )
+        )
+    )
+RETURN
+    DIVIDE ( WithinTarget, [Interactions] )
+
+
+/// Share of agents whose CSAT is at or above their own target.
+/// Format: 0.0%
+% Agents Meeting CSAT Target =
+VAR AgentsInScope =
+    CALCULATETABLE (
+        VALUES ( dim_agent[agent_key] ),
+        fact_interactions[has_survey_response] = TRUE ()
+    )
+VAR Meeting =
+    COUNTROWS ( FILTER ( AgentsInScope, [CSAT %] >= [CSAT Target %] ) )
+RETURN
+    DIVIDE ( Meeting, COUNTROWS ( AgentsInScope ) )
+
+
+/// A single red/amber/green verdict for a KPI card. Returns 1 ahead,
+/// 0 on track (within 2pp), −1 behind. Drive card colour from this rather
+/// than repeating thresholds in conditional formatting.
+CSAT Target Status =
+VAR Gap = [CSAT vs Target (pp)]
+RETURN
+    SWITCH ( TRUE (), ISBLANK ( Gap ), BLANK (), Gap >= 2, 1, Gap <= -2, -1, 0 )
+
+
+/// Same traffic light for FCR against the industry benchmark.
+FCR Benchmark Status =
+VAR Gap = [FCR vs Benchmark (pp)]
+RETURN
+    SWITCH ( TRUE (), ISBLANK ( Gap ), BLANK (), Gap >= 1, 1, Gap <= -1, -1, 0 )
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  07 Report furniture
+//  Labels every page carries. Drop these on a card visual.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Freshness stamp for the "data as of" card. Reads the latest contact in the
+/// model, NOT today's date, so a stale refresh is visible rather than hidden
+/// behind a clock that keeps ticking. ALL() so page filters cannot make the
+/// data look fresher than it is.
+Data As Of =
+VAR LastContact =
+    CALCULATE ( MAX ( fact_interactions[start_datetime] ), ALL ( fact_interactions ) )
+RETURN
+    "Data as of " & FORMAT ( LastContact, "d MMM yyyy" )
+
+
+/// Provenance banner. Required on every page — this model contains no real
+/// customers, agents or conversations, and anything screenshotted out of it
+/// must say so on the face of the image.
+Synthetic Data Label =
+"⚠ SYNTHETIC DEMONSTRATION DATA — no real customers, agents or conversations"
+
+
+/// How the sentiment scores were produced, for the footer of the methodology
+/// page. Blank-safe if the model has not been scored.
+Model Version =
+CALCULATE (
+    SELECTEDVALUE ( fact_interactions[model_version], "not scored" ),
+    ALL ( fact_interactions )
+)
+
+
+// ─────────────────────────────────────────────────────────────────────
+//  Display folder:  08 Coaching queue
+// ─────────────────────────────────────────────────────────────────────
+
+/// A 0–100 score for "how much does this contact deserve a listen?".
+///
+/// Weighted from the signals that actually predict a bad experience, with the
+/// calibrated end-of-call sentiment carrying the most weight because that is
+/// the signal validation showed to be trustworthy (see docs/validation.md).
+/// Evaluated at interaction grain — put interaction_id on the visual.
+///
+/// The weights are a judgement call, not a fitted model. Tune them with a team
+/// lead rather than treating them as objective. Format: 0
+Coaching Priority =
+VAR EndSentiment = AVERAGE ( fact_interactions[sentiment_end] )
+VAR Shift = AVERAGE ( fact_interactions[sentiment_shift] )
+VAR HoldMinutes = DIVIDE ( SUM ( fact_interactions[hold_time_sec] ), 60 )
+VAR OverTarget = [AHT vs Target %]
+VAR RepeatContact =
+    CALCULATE ( [Interactions], KEEPFILTERS ( fact_interactions[is_repeat_contact_7d] = TRUE () ) )
+VAR Escalated =
+    CALCULATE ( [Interactions], KEEPFILTERS ( fact_interactions[is_escalated] = TRUE () ) )
+RETURN
+    IF (
+        ISBLANK ( [Interactions] ),
+        BLANK (),
+        // ended badly — the strongest single signal
+        IF ( EndSentiment < -0.25, 40, 0 )
+            // started fine and got worse: something happened mid-call
+            + IF ( Shift < -0.3, 20, 0 )
+            // long hold: the most common avoidable cause of a bad experience
+            + IF ( HoldMinutes > 3, 15, 0 )
+            // ran well over this agent's own target
+            + IF ( OverTarget > 0.25, 10, 0 )
+            // the customer had to come back
+            + IF ( RepeatContact > 0, 10, 0 )
+            + IF ( Escalated > 0, 5, 0 )
+    )
+
+
+/// 1 for the ten highest-priority contacts in the current slicer context,
+/// 0 otherwise. Use as a visual-level filter (is 1) on the coaching queue
+/// table.
+///
+/// ALLSELECTED, not ALL: the queue re-ranks inside whatever the user has
+/// filtered to, so a lead who picks their own team gets their team's top ten
+/// rather than ten rows that all belong to someone else.
+Top 10 Coaching Flag =
+VAR Queue =
+    TOPN (
+        10,
+        ALLSELECTED ( fact_interactions[interaction_id] ),
+        [Coaching Priority], DESC
+    )
+VAR ThisRow = VALUES ( fact_interactions[interaction_id] )
+RETURN
+    INT ( NOT ISEMPTY ( INTERSECT ( ThisRow, Queue ) ) )
+
+
+/// Position in the coaching queue, 1 = most urgent. Sort the table by this.
+/// Format: 0
+Coaching Rank =
+IF (
+    NOT ISBLANK ( [Coaching Priority] ),
+    RANKX (
+        ALLSELECTED ( fact_interactions[interaction_id] ),
+        [Coaching Priority], , DESC, DENSE
+    )
+)
+
+
+// =====================================================================
+//  OPTIONAL — Tabular Editor C# script to apply the display folders.
+//  Paste into Tabular Editor's Advanced Scripting tab and run once.
+// =====================================================================
+/*
+var folders = new Dictionary<string, string> {
+    {"Interactions","99 Base"}, {"Scored Interactions","99 Base"},
+    {"Cases","99 Base"}, {"Survey Responses","99 Base"},
+    {"Handle Seconds","99 Base"}, {"Target Handle Seconds","99 Base"},
+
+    {"Contacts","01 Volume"}, {"Customers","01 Volume"},
+    {"Contacts per Business Day","01 Volume"},
+
+    {"AHT (minutes)","02 Efficiency"}, {"Hold (minutes)","02 Efficiency"},
+    {"Hold Rate %","02 Efficiency"}, {"AHT Target (minutes)","02 Efficiency"},
+    {"AHT vs Target %","02 Efficiency"}, {"AHT vs Target (minutes)","02 Efficiency"},
+
+    {"CSAT %","03 Quality\\Survey"}, {"CSAT Detractor %","03 Quality\\Survey"},
+    {"Avg CSAT Score","03 Quality\\Survey"},
+    {"Survey Response Rate %","03 Quality\\Survey"},
+    {"CSAT Target %","03 Quality\\Survey"}, {"CSAT vs Target (pp)","03 Quality\\Survey"},
+    {"Survey Resolved %","03 Quality\\Survey"},
+
+    {"FCR % (SQM)","03 Quality\\FCR"}, {"FCR Benchmark %","03 Quality\\FCR"},
+    {"FCR vs Benchmark (pp)","03 Quality\\FCR"},
+    {"Months Above Benchmark","03 Quality\\FCR"},
+
+    {"Repeat Contacts","03 Quality\\Repeat Contact"},
+    {"Repeat Contact Rate %","03 Quality\\Repeat Contact"},
+    {"Escalation Rate %","03 Quality\\Repeat Contact"},
+    {"Avg Days to Close","03 Quality\\Repeat Contact"},
+
+    {"% Negative","04 Sentiment"}, {"% Positive","04 Sentiment"},
+    {"Net Sentiment","04 Sentiment"}, {"Avg Sentiment Score","04 Sentiment"},
+    {"Sentiment Shift","04 Sentiment"}, {"Recovered Contacts","04 Sentiment"},
+    {"Deteriorated Contacts","04 Sentiment"},
+    {"% Negative (Calibrated)","04 Sentiment"},
+    {"Net Sentiment (Calibrated)","04 Sentiment"},
+
+    {"Contacts PM","05 Change over time\\Previous month"},
+    {"AHT (minutes) PM","05 Change over time\\Previous month"},
+    {"CSAT % PM","05 Change over time\\Previous month"},
+    {"Net Sentiment PM","05 Change over time\\Previous month"},
+    {"% Negative PM","05 Change over time\\Previous month"},
+    {"Repeat Contact Rate % PM","05 Change over time\\Previous month"},
+    {"FCR % (SQM) PM","05 Change over time\\Previous month"},
+
+    {"Contacts MoM","05 Change over time\\MoM"},
+    {"Contacts MoM %","05 Change over time\\MoM"},
+    {"AHT MoM (minutes)","05 Change over time\\MoM"},
+    {"CSAT MoM (pp)","05 Change over time\\MoM"},
+    {"Net Sentiment MoM","05 Change over time\\MoM"},
+    {"% Negative MoM (pp)","05 Change over time\\MoM"},
+    {"Repeat Contact Rate MoM (pp)","05 Change over time\\MoM"},
+    {"FCR MoM (pp)","05 Change over time\\MoM"},
+
+    {"Data As Of","07 Report furniture"},
+    {"Synthetic Data Label","07 Report furniture"},
+    {"Model Version","07 Report furniture"},
+    {"Coaching Priority","08 Coaching queue"},
+    {"Top 10 Coaching Flag","08 Coaching queue"},
+    {"Coaching Rank","08 Coaching queue"},
+
+    {"% Within AHT Target","06 Variance to target"},
+    {"% Agents Meeting CSAT Target","06 Variance to target"},
+    {"CSAT Target Status","06 Variance to target"},
+    {"FCR Benchmark Status","06 Variance to target"}
+};
+foreach (var m in Model.AllMeasures)
+    if (folders.ContainsKey(m.Name)) m.DisplayFolder = folders[m.Name];
+// Hide the plumbing.
+foreach (var m in Model.AllMeasures)
+    if (m.DisplayFolder.StartsWith("99") || m.DisplayFolder.EndsWith("Previous month"))
+        m.IsHidden = true;
+*/
